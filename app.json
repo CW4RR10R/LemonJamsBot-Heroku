@@ -7,7 +7,7 @@
             "value":""
         },
         "WEBSOCKET_URL":{
-            "description":"websocket url from LemonJamServer",
+            "description":"websocket url from https://github.com/CW4RR10R/LemonJamServer",
             "value": "http://appname.herokuapp.com"
         }
     },
