@@ -1,18 +1,25 @@
 import { Chat } from 'typegram';
 import { exec as _exec, spawn } from 'child_process';
 import { JoinVoiceCallResponse } from 'tgcalls/lib/types';
-import { promisify } from 'util';
 import { Stream, TGCalls } from 'tgcalls';
 import env from './env';
 import WebSocket from 'ws';
 import { Readable } from 'stream';
 
-const exec = promisify(_exec);
+interface DownloadedSong {
+    stream: Readable;
+    info: {
+        id: string;
+        title: string;
+        duration: number;
+    };
+}
 
 interface CachedConnection {
     connection: TGCalls<{ chat: Chat.SupergroupChat }>;
     stream: Stream;
     queue: string[];
+    currentSong: DownloadedSong['info'] | null;
     joinResolve?: (value: JoinVoiceCallResponse) => void;
 }
 
@@ -39,10 +46,38 @@ ws.on('message', response => {
     }
 });
 
-const downloadSong = async (url: string): Promise<Readable> => {
-    const { stdout } = await exec(`youtube-dl --extract-audio --get-url -- "${url}"`);
-    const ffmpeg = spawn('ffmpeg', ['-y', '-i', stdout.trim(), ...ffmpegOptions]);
-    return ffmpeg.stdout;
+const downloadSong = async (url: string): Promise<DownloadedSong> => {
+    return new Promise((resolve, reject) => {
+        const ytdlChunks: string[] = [];
+        const ytdl = spawn('youtube-dl', ['--extract-audio', '--print-json', '--get-url', url.replace(/'/g, `'"'"'`)]);
+
+        ytdl.stderr.on('data', data => console.error(data.toString()));
+
+        ytdl.stdout.on('data', data => {
+            ytdlChunks.push(data.toString());
+        });
+
+        ytdl.on('exit', code => {
+            if (code !== 0) {
+                return reject();
+            }
+
+            const ytdlData = ytdlChunks.join('');
+            const [inputUrl, _videoInfo] = ytdlData.split('\n');
+            const videoInfo = JSON.parse(_videoInfo);
+
+            const ffmpeg = spawn('ffmpeg', ['-y', '-i', inputUrl, ...ffmpegOptions]);
+
+            resolve({
+                stream: ffmpeg.stdout,
+                info: {
+                    id: videoInfo.id,
+                    title: videoInfo.title,
+                    duration: videoInfo.duration,
+                },
+            });
+        });
+    });
 };
 
 const createConnection = async (chat: Chat.SupergroupChat): Promise<void> => {
@@ -58,6 +93,7 @@ const createConnection = async (chat: Chat.SupergroupChat): Promise<void> => {
         connection,
         stream,
         queue,
+        currentSong: null,
     };
 
     connection.joinVoiceCall = payload => {
@@ -86,8 +122,14 @@ const createConnection = async (chat: Chat.SupergroupChat): Promise<void> => {
     stream.on('finish', async () => {
         if (queue.length > 0) {
             const url = queue.shift()!;
-            const readable = await downloadSong(url);
-            stream.setReadable(readable);
+            try {
+                const song = await downloadSong(url);
+                stream.setReadable(song.stream);
+                cachedConnection.currentSong = song.info;
+            } catch (error) {
+                console.error(error);
+                stream.emit('finish');
+            }
         }
     });
 };
@@ -98,15 +140,34 @@ export const addToQueue = async (chat: Chat.SupergroupChat, url: string): Promis
         return addToQueue(chat, url);
     }
 
-    const { stream, queue } = cache.get(chat.id)!;
+    const connection = cache.get(chat.id)!;
+    const { stream, queue } = connection;
 
     if (stream.finished) {
-        const readable = await downloadSong(url);
-        stream.setReadable(readable);
+        try {
+            const song = await downloadSong(url);
+            stream.setReadable(song.stream);
+            connection.currentSong = song.info;
+
+            cache.set(chat.id, connection);
+        } catch (error) {
+            console.error(error);
+            return -1;
+        }
+
         return 0;
     }
 
     return queue.push(url);
+};
+
+export const getCurrentSong = (chatId: number): DownloadedSong['info'] | null => {
+    if (cache.has(chatId)) {
+        const { currentSong } = cache.get(chatId)!;
+        return currentSong;
+    }
+
+    return null;
 };
 
 export const getQueue = (chatId: number): string[] | null => {
